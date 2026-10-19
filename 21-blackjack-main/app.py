@@ -2,7 +2,10 @@ import html
 import json
 import random
 import time
+from io import BytesIO
+from urllib.parse import urlencode
 
+import qrcode
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
@@ -323,14 +326,23 @@ def render_online_room(client) -> None:
                 st.caption("Guarde este segredo para manter suas estatísticas em outras salas.")
                 st.code(profile_token)
         if invite_token and game["names"][1] == "Aguardando jogador":
-            st.info(
-                "Guarde sua credencial privada para reconectar e compartilhe somente o convite "
-                "do jogador 2."
+            invite_url = (
+                f"{st.session_state.online_public_app_url}?"
+                f"{urlencode({'r': room_code, 'i': invite_token})}"
             )
-            st.caption("Seu segredo privado (não compartilhe):")
-            st.code(player_token)
-            st.caption("Convite privado do jogador 2:")
-            st.code(invite_token)
+            qr_image = qrcode.make(invite_url)
+            qr_buffer = BytesIO()
+            qr_image.save(qr_buffer, format="PNG")
+            st.markdown("### Convide o segundo jogador")
+            st.image(qr_buffer.getvalue(), width=220, caption="Escaneie para abrir o convite")
+            st.code(invite_url, language=None)
+            st.caption(
+                "Envie este link ou QR apenas ao jogador convidado. O convite é de uso único; "
+                "depois que ele entrar, o segredo da sala muda."
+            )
+            with st.expander("Credencial privada para reconectar"):
+                st.caption("Guarde este segredo. Não o compartilhe com o outro jogador.")
+                st.code(player_token)
         if game["names"][1] == "Aguardando jogador":
             st.info("Aguardando o segundo jogador entrar na sala.")
 
@@ -556,6 +568,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if st.query_params.get("r") and st.query_params.get("i"):
+    st.session_state.play_mode = "Sala online"
+
 play_mode = st.radio(
     "Modo de jogo",
     ["Local", "Sala online"],
@@ -585,6 +600,16 @@ if play_mode == "Sala online":
             "nos segredos do Streamlit."
         )
         st.stop()
+    st.session_state.online_public_app_url = supabase_config.get(
+        "public_app_url",
+        "https://21-black-versao-main-f3leeeayx9nksixb9syhbx.streamlit.app",
+    ).rstrip("/")
+    invite_code = st.query_params.get("r")
+    invite_token = st.query_params.get("i")
+    if invite_code and invite_token:
+        st.session_state.pending_invite_code = str(invite_code).upper()
+        st.session_state.pending_invite_token = str(invite_token)
+        st.query_params.clear()
 
     try:
         supabase = get_supabase_client(supabase_url, supabase_anon_key)
@@ -593,7 +618,14 @@ if play_mode == "Sala online":
         st.stop()
 
     if not st.session_state.get("online_room_code") or not st.session_state.get("online_player_token"):
-        create_tab, join_tab, reconnect_tab = st.tabs(["Criar sala", "Entrar com convite", "Reconectar"])
+        if st.session_state.get("pending_invite_code"):
+            join_tab, create_tab, reconnect_tab = st.tabs(
+                ["Entrar com convite", "Criar sala", "Reconectar"]
+            )
+        else:
+            create_tab, join_tab, reconnect_tab = st.tabs(
+                ["Criar sala", "Entrar com convite", "Reconectar"]
+            )
         with create_tab:
             with st.form("create_online_room"):
                 room_name = st.text_input("Seu nome", value="Jogador 1", max_chars=18)
@@ -633,8 +665,16 @@ if play_mode == "Sala online":
                     st.rerun()
         with join_tab:
             with st.form("join_online_room"):
-                join_code = st.text_input("Código da sala", max_chars=6).strip().upper()
-                join_token = st.text_input("Convite privado do jogador 2", type="password")
+                join_code = st.text_input(
+                    "Código da sala",
+                    value=st.session_state.get("pending_invite_code", ""),
+                    max_chars=6,
+                ).strip().upper()
+                join_token = st.text_input(
+                    "Convite privado do jogador 2",
+                    value=st.session_state.get("pending_invite_token", ""),
+                    type="password",
+                )
                 join_name = st.text_input("Seu nome", value="Jogador 2", max_chars=18)
                 join_profile_token = st.text_input(
                     "Token de perfil existente (opcional)",
@@ -659,9 +699,11 @@ if play_mode == "Sala online":
                     st.error(f"Não foi possível entrar na sala: {error}")
                 else:
                     st.session_state.online_room_code = joined["code"]
-                    st.session_state.online_player_token = join_token
+                    st.session_state.online_player_token = joined["player_token"]
                     st.session_state.online_guest_token = ""
                     st.session_state.online_profile_token = joined["profile_token"]
+                    st.session_state.pop("pending_invite_code", None)
+                    st.session_state.pop("pending_invite_token", None)
                     st.rerun()
         with reconnect_tab:
             with st.form("reconnect_online_room"):
