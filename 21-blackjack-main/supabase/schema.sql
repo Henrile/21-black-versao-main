@@ -5,6 +5,7 @@ create table if not exists public.blackjack_player_profiles (
     player_id uuid primary key,
     token_hash text not null unique,
     display_name text not null,
+    wallet numeric(12,2) not null default 50.00,
     created_at timestamptz not null default now()
 );
 
@@ -29,6 +30,9 @@ create table if not exists public.blackjack_rooms (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table public.blackjack_player_profiles
+    add column if not exists wallet numeric(12,2) not null default 50.00;
 
 insert into public.blackjack_player_profiles(player_id, token_hash, display_name)
 select
@@ -102,6 +106,20 @@ begin
 end;
 $$;
 
+create or replace function public._bj_mask_dealer(p_state jsonb)
+returns jsonb
+language plpgsql
+immutable
+set search_path = public, extensions, pg_temp
+as $$
+begin
+    if p_state->>'over' = 'true' or p_state#>>'{hands,2,1}' is null then
+        return p_state;
+    end if;
+    return jsonb_set(p_state, '{hands,2,1}', '{"rank":"?","suit":"?"}'::jsonb);
+end;
+$$;
+
 create or replace function public._bj_get_or_create_profile(p_token text, p_name text)
 returns jsonb
 language plpgsql
@@ -141,12 +159,14 @@ begin
 end;
 $$;
 
+drop function if exists public.create_blackjack_room(text, text, integer, text, text);
 create or replace function public.create_blackjack_room(
     p_name text,
     p_rules text default 'Blackjack',
     p_best_of integer default 1,
     p_theme text default 'Cassino',
-    p_profile_token text default null
+    p_profile_token text default null,
+    p_bet numeric default 5
 )
 returns jsonb
 language plpgsql
@@ -162,18 +182,30 @@ declare
     player_two_id uuid;
     game_state jsonb;
     cards jsonb;
-    hands jsonb := '[[],[]]'::jsonb;
+    hands jsonb := '[[],[],[]]'::jsonb;
     card jsonb;
     player_index integer;
     deal_index integer;
+    player_wallet numeric(12,2);
 begin
     if coalesce(length(trim(p_name)), 0) not between 1 and 18 then
         raise exception 'O nome deve ter entre 1 e 18 caracteres.';
     end if;
-    if p_rules is null or p_rules not in ('Blackjack', '21 simples')
+    if p_rules is distinct from 'Blackjack'
        or p_best_of is null or p_best_of not in (1, 3, 5)
-       or p_theme is null or p_theme not in ('Cassino', 'Neon', 'Clássico') then
+       or p_theme is null or p_theme not in ('Velho Oeste', 'Cassino', 'Neon', 'Clássico')
+       or p_bet is null or p_bet < 1 or p_bet <> trunc(p_bet) then
         raise exception 'Configuração de partida inválida.';
+    end if;
+
+    player_profile := public._bj_get_or_create_profile(p_profile_token, p_name);
+    player_one_id := (player_profile->>'player_id')::uuid;
+    select wallet into player_wallet
+    from public.blackjack_player_profiles
+    where player_id = player_one_id
+    for update;
+    if p_bet > player_wallet then
+        raise exception 'Saldo insuficiente para essa aposta.';
     end if;
 
     loop
@@ -184,10 +216,12 @@ begin
     cards := public._bj_new_deck();
     for deal_index in 1..2
     loop
-        player_index := (deal_index - 1) % 2;
-        card := cards->(jsonb_array_length(cards) - 1);
-        cards := cards - (jsonb_array_length(cards) - 1);
-        hands := jsonb_set(hands, array[player_index::text], (hands->player_index) || jsonb_build_array(card));
+        for player_index in 0..2
+        loop
+            card := cards->(jsonb_array_length(cards) - 1);
+            cards := cards - (jsonb_array_length(cards) - 1);
+            hands := jsonb_set(hands, array[player_index::text], (hands->player_index) || jsonb_build_array(card));
+        end loop;
     end loop;
 
     game_state := jsonb_build_object(
@@ -195,12 +229,14 @@ begin
         'names', jsonb_build_array(trim(p_name), 'Aguardando jogador'),
         'rules', p_rules,
         'theme', p_theme,
+        'bets', jsonb_build_array(p_bet, 0),
+        'wallets', jsonb_build_array(player_wallet, 0),
         'best_of', p_best_of,
         'wins_needed', p_best_of / 2 + 1,
         'round_number', 1,
         'match_wins', '[0,0]'::jsonb,
         'hands', hands,
-        'finished', '[false,false]'::jsonb,
+        'finished', '[false,false,false]'::jsonb,
         'current_player', 0,
         'history', '[]'::jsonb,
         'dealer_playing', false,
@@ -209,8 +245,6 @@ begin
         'result', ''
     );
 
-    player_profile := public._bj_get_or_create_profile(p_profile_token, p_name);
-    player_one_id := (player_profile->>'player_id')::uuid;
     insert into public.blackjack_rooms(
         code, state, deck, player_one_id, player_two_id,
         player_one_token_hash, player_two_token_hash
@@ -226,16 +260,18 @@ begin
         'player_token', player_one_token,
         'guest_token', player_two_token,
         'profile_token', player_profile->>'profile_token',
-        'state', game_state
+        'state', public._bj_mask_dealer(game_state)
     );
 end;
 $$;
 
+drop function if exists public.join_blackjack_room(text, text, text, text);
 create or replace function public.join_blackjack_room(
     p_code text,
     p_token text,
     p_name text,
-    p_profile_token text default null
+    p_profile_token text default null,
+    p_bet numeric default 5
 )
 returns jsonb
 language plpgsql
@@ -246,7 +282,11 @@ declare
     room public.blackjack_rooms%rowtype;
     game_state jsonb;
     player_profile jsonb;
-    player_id uuid;
+    joined_player_id uuid;
+    player_two_token text := encode(extensions.gen_random_bytes(24), 'hex');
+    player_one_wallet numeric(12,2);
+    player_two_wallet numeric(12,2);
+    player_one_bet numeric(12,2);
 begin
     if coalesce(length(trim(p_name)), 0) not between 1 and 18 then
         raise exception 'O nome deve ter entre 1 e 18 caracteres.';
@@ -261,16 +301,48 @@ begin
     if room.player_two_id is not null then
         raise exception 'O segundo assento já foi ocupado.';
     end if;
+    if p_bet is null or p_bet < 1 or p_bet <> trunc(p_bet) then
+        raise exception 'A aposta precisa ser de pelo menos $1.';
+    end if;
     player_profile := public._bj_get_or_create_profile(p_profile_token, p_name);
-    player_id := (player_profile->>'player_id')::uuid;
+    joined_player_id := (player_profile->>'player_id')::uuid;
+    if joined_player_id = room.player_one_id then
+        raise exception 'Use um perfil diferente para cada jogador.';
+    end if;
+    player_one_bet := (room.state#>>'{bets,0}')::numeric;
+    select wallet into player_one_wallet
+    from public.blackjack_player_profiles
+    where player_id = room.player_one_id
+    for update;
+    select wallet into player_two_wallet
+    from public.blackjack_player_profiles
+    where public.blackjack_player_profiles.player_id = joined_player_id
+    for update;
+    if player_one_wallet < player_one_bet or player_two_wallet < p_bet then
+        raise exception 'Um dos jogadores não tem saldo suficiente para a aposta.';
+    end if;
+    update public.blackjack_player_profiles
+    set wallet = wallet - player_one_bet
+    where player_id = room.player_one_id;
+    update public.blackjack_player_profiles
+    set wallet = wallet - p_bet
+    where public.blackjack_player_profiles.player_id = joined_player_id;
+
     game_state := room.state;
     game_state := jsonb_set(game_state, '{names,1}', to_jsonb(trim(p_name)));
+    game_state := jsonb_set(game_state, '{bets,1}', to_jsonb(p_bet));
+    game_state := jsonb_set(game_state, '{wallets,0}', to_jsonb(player_one_wallet - player_one_bet));
+    game_state := jsonb_set(game_state, '{wallets,1}', to_jsonb(player_two_wallet - p_bet));
     update public.blackjack_rooms
-    set state = game_state, player_two_id = player_id, updated_at = now()
+    set state = game_state,
+        player_two_id = joined_player_id,
+        player_two_token_hash = encode(extensions.digest(player_two_token, 'sha256'), 'hex'),
+        updated_at = now()
     where code = room.code;
     return jsonb_build_object(
         'code', room.code,
-        'state', game_state,
+        'player_token', player_two_token,
+        'state', public._bj_mask_dealer(game_state),
         'profile_token', player_profile->>'profile_token'
     );
 end;
@@ -286,6 +358,7 @@ declare
     room public.blackjack_rooms%rowtype;
     player_seat integer;
     player_stats jsonb;
+    response_state jsonb;
 begin
     select * into room from public.blackjack_rooms where code = upper(trim(p_code));
     if not found then
@@ -304,22 +377,28 @@ begin
             'games_played', coalesce(one_stats.games_played, 0),
             'wins', coalesce(one_stats.wins, 0),
             'losses', coalesce(one_stats.losses, 0),
-            'draws', coalesce(one_stats.draws, 0)
+            'draws', coalesce(one_stats.draws, 0),
+            'wallet', one_profile.wallet
         ),
         jsonb_build_object(
             'games_played', coalesce(two_stats.games_played, 0),
             'wins', coalesce(two_stats.wins, 0),
             'losses', coalesce(two_stats.losses, 0),
-            'draws', coalesce(two_stats.draws, 0)
+            'draws', coalesce(two_stats.draws, 0),
+            'wallet', two_profile.wallet
         )
     ) into player_stats
     from (select 1) seed
     left join public.blackjack_player_stats one_stats on one_stats.player_id = room.player_one_id
-    left join public.blackjack_player_stats two_stats on two_stats.player_id = room.player_two_id;
+    left join public.blackjack_player_stats two_stats on two_stats.player_id = room.player_two_id
+    left join public.blackjack_player_profiles one_profile on one_profile.player_id = room.player_one_id
+    left join public.blackjack_player_profiles two_profile on two_profile.player_id = room.player_two_id;
+
+    response_state := public._bj_mask_dealer(room.state);
 
     return jsonb_build_object(
         'code', room.code,
-        'state', room.state,
+        'state', response_state,
         'my_seat', player_seat,
         'stats', coalesce(player_stats, '[]'::jsonb),
         'updated_at', room.updated_at
@@ -344,14 +423,19 @@ declare
     hands jsonb;
     finished jsonb;
     history jsonb;
-    scores integer[];
-    winners integer[];
-    best_score integer;
-    winner_index integer;
     match_wins jsonb;
     match_over boolean;
     result_text text;
     score_after_draw integer;
+    dealer_score integer;
+    player_score integer;
+    bet_amount numeric(12,2);
+    payout numeric(12,2);
+    player_wallet numeric(12,2);
+    player_natural boolean;
+    dealer_natural boolean;
+    outcome text;
+    round_results text[] := array[]::text[];
 begin
     if p_action is null or p_action not in ('buy', 'stand') then
         raise exception 'Jogada inválida.';
@@ -379,22 +463,23 @@ begin
     history := game_state->'history';
     cards := room.deck;
     if p_action = 'buy' then
+        if public._bj_score(hands->player_seat, 'Blackjack') >= 21 then
+            raise exception 'Você não pode pedir carta com 21 ou mais pontos.';
+        end if;
         if jsonb_array_length(cards) = 0 then
             cards := public._bj_new_deck();
         end if;
         card := cards->(jsonb_array_length(cards) - 1);
         cards := cards - (jsonb_array_length(cards) - 1);
         hands := jsonb_set(hands, array[player_seat::text], (hands->player_seat) || jsonb_build_array(card));
-        score_after_draw := public._bj_score(hands->player_seat, game_state->>'rules');
+        score_after_draw := public._bj_score(hands->player_seat, 'Blackjack');
         result_text := (game_state#>>array['names', player_seat::text]) || ' comprou '
             || (card->>'rank') || (card->>'suit') || ' ('
             || score_after_draw::text || ' pontos).';
         history := history || jsonb_build_array(result_text);
         if score_after_draw >= 21 then
             finished := jsonb_set(finished, array[player_seat::text], 'true'::jsonb);
-            if score_after_draw = 21 then
-                history := history || jsonb_build_array((game_state#>>array['names', player_seat::text]) || ' chegou a 21!');
-            else
+            if score_after_draw > 21 then
                 history := history || jsonb_build_array((game_state#>>array['names', player_seat::text]) || ' estourou 21.');
             end if;
         end if;
@@ -421,66 +506,89 @@ begin
     if next_player is not null then
         game_state := jsonb_set(game_state, '{current_player}', to_jsonb(next_player));
     else
-        scores := array[
-            public._bj_score(hands->0, game_state->>'rules'),
-            public._bj_score(hands->1, game_state->>'rules')
-        ];
-        winners := array[]::integer[];
-        best_score := -1;
-        for player_index in 0..1
+        dealer_score := public._bj_score(hands->2, 'Blackjack');
+        while dealer_score < 17
         loop
-            if scores[player_index + 1] <= 21 then
-                if scores[player_index + 1] > best_score then
-                    best_score := scores[player_index + 1];
-                    winners := array[player_index];
-                elsif scores[player_index + 1] = best_score then
-                    winners := array_append(winners, player_index);
-                end if;
+            if jsonb_array_length(cards) = 0 then
+                cards := public._bj_new_deck();
             end if;
-        end loop;
-
-        match_wins := game_state->'match_wins';
-        if cardinality(winners) = 1 then
-            winner_index := winners[1];
-            match_wins := jsonb_set(
-                match_wins, array[winner_index::text],
-                to_jsonb((match_wins->>winner_index)::integer + 1)
+            card := cards->(jsonb_array_length(cards) - 1);
+            cards := cards - (jsonb_array_length(cards) - 1);
+            hands := jsonb_set(hands, '{2}', (hands->2) || jsonb_build_array(card));
+            history := history || jsonb_build_array(
+                'Dealer comprou ' || (card->>'rank') || (card->>'suit') || '.'
             );
-            result_text := (game_state#>>array['names', winner_index::text])
-                || ' venceu a rodada com ' || best_score::text || ' pontos!';
-        elsif cardinality(winners) > 1 then
-            result_text := 'Empate!';
-        else
-            result_text := 'Todos estouraram. Ninguém venceu desta vez.';
-        end if;
-
+            dealer_score := public._bj_score(hands->2, 'Blackjack');
+        end loop;
+        finished := jsonb_set(finished, '{2}', 'true'::jsonb);
+        dealer_natural := jsonb_array_length(hands->2) = 2 and dealer_score = 21;
         for player_index in 0..1
         loop
+            player_score := public._bj_score(hands->player_index, 'Blackjack');
+            player_natural := jsonb_array_length(hands->player_index) = 2 and player_score = 21;
+            bet_amount := (game_state#>>array['bets', player_index::text])::numeric;
+            if player_score > 21 or (dealer_natural and not player_natural) then
+                payout := 0;
+                outcome := 'perdeu';
+            elsif player_natural and dealer_natural then
+                payout := bet_amount;
+                outcome := 'empatou';
+            elsif player_natural then
+                payout := bet_amount * 2.5;
+                outcome := 'venceu com Blackjack natural';
+            elsif dealer_score > 21 or player_score > dealer_score then
+                payout := bet_amount * 2;
+                outcome := 'venceu';
+            elsif player_score = dealer_score then
+                payout := bet_amount;
+                outcome := 'empatou';
+            else
+                payout := 0;
+                outcome := 'perdeu';
+            end if;
+            update public.blackjack_player_profiles
+            set wallet = wallet + payout
+            where player_id = case when player_index = 0 then room.player_one_id else room.player_two_id end
+            returning wallet into player_wallet;
+            game_state := jsonb_set(
+                game_state, array['wallets', player_index::text], to_jsonb(player_wallet)
+            );
             update public.blackjack_player_stats
             set games_played = games_played + 1,
-                wins = wins + case when cardinality(winners) = 1 and winners[1] = player_index then 1 else 0 end,
-                losses = losses + case when cardinality(winners) = 1 and winners[1] <> player_index then 1 else 0 end,
-                draws = draws + case when cardinality(winners) <> 1 then 1 else 0 end,
+                wins = wins + case when outcome like 'venceu%' then 1 else 0 end,
+                losses = losses + case when outcome = 'perdeu' then 1 else 0 end,
+                draws = draws + case when outcome = 'empatou' then 1 else 0 end,
                 updated_at = now()
             where player_id = case when player_index = 0 then room.player_one_id else room.player_two_id end;
+            if outcome like 'venceu%' then
+                game_state := jsonb_set(
+                    game_state, array['match_wins', player_index::text],
+                    to_jsonb((game_state#>>array['match_wins', player_index::text])::integer + 1)
+                );
+            end if;
+            round_results := array_append(
+                round_results,
+                (game_state#>>array['names', player_index::text]) || ' ' || outcome
+                || ' (' || player_score::text || ' contra ' || dealer_score::text
+                || '); carteira: $' || to_char(player_wallet, 'FM999999990.00')
+            );
         end loop;
-
+        match_wins := game_state->'match_wins';
         match_over := greatest((match_wins->>0)::integer, (match_wins->>1)::integer)
             >= (game_state->>'wins_needed')::integer;
-        if match_over then
-            winner_index := case when (match_wins->>0)::integer > (match_wins->>1)::integer then 0 else 1 end;
-            result_text := (game_state#>>array['names', winner_index::text]) || ' venceu a série!';
-        end if;
-        game_state := jsonb_set(game_state, '{match_wins}', match_wins);
+        result_text := array_to_string(round_results, ' | ');
         game_state := jsonb_set(game_state, '{match_over}', to_jsonb(match_over));
         game_state := jsonb_set(game_state, '{over}', 'true'::jsonb);
         game_state := jsonb_set(game_state, '{result}', to_jsonb(result_text));
     end if;
+    game_state := jsonb_set(game_state, '{hands}', hands);
+    game_state := jsonb_set(game_state, '{finished}', finished);
+    game_state := jsonb_set(game_state, '{history}', history);
 
     update public.blackjack_rooms
     set state = game_state, deck = cards, updated_at = now()
     where code = room.code;
-    return jsonb_build_object('state', game_state);
+    return jsonb_build_object('state', public._bj_mask_dealer(game_state));
 end;
 $$;
 
@@ -495,11 +603,13 @@ declare
     player_seat integer;
     game_state jsonb;
     cards jsonb;
-    hands jsonb := '[[],[]]'::jsonb;
+    hands jsonb := '[[],[],[]]'::jsonb;
     card jsonb;
     player_index integer;
     deal_index integer;
     new_round integer;
+    bet_amount numeric(12,2);
+    player_wallet numeric(12,2);
 begin
     select * into room from public.blackjack_rooms where code = upper(trim(p_code)) for update;
     if not found then
@@ -517,19 +627,38 @@ begin
         raise exception 'A rodada ainda não terminou.';
     end if;
 
+    for player_index in 0..1
+    loop
+        bet_amount := (game_state#>>array['bets', player_index::text])::numeric;
+        update public.blackjack_player_profiles
+        set wallet = wallet - bet_amount
+        where player_id = case when player_index = 0 then room.player_one_id else room.player_two_id end
+          and wallet >= bet_amount
+        returning wallet into player_wallet;
+        if not found then
+            raise exception 'Saldo insuficiente para % continuar apostando.',
+                game_state#>>array['names', player_index::text];
+        end if;
+        game_state := jsonb_set(
+            game_state, array['wallets', player_index::text], to_jsonb(player_wallet)
+        );
+    end loop;
+
     cards := public._bj_new_deck();
     for deal_index in 1..2
     loop
-        player_index := (deal_index - 1) % 2;
-        card := cards->(jsonb_array_length(cards) - 1);
-        cards := cards - (jsonb_array_length(cards) - 1);
-        hands := jsonb_set(hands, array[player_index::text], (hands->player_index) || jsonb_build_array(card));
+        for player_index in 0..2
+        loop
+            card := cards->(jsonb_array_length(cards) - 1);
+            cards := cards - (jsonb_array_length(cards) - 1);
+            hands := jsonb_set(hands, array[player_index::text], (hands->player_index) || jsonb_build_array(card));
+        end loop;
     end loop;
     new_round := case when game_state->>'match_over' = 'true' then 1 else (game_state->>'round_number')::integer + 1 end;
     game_state := jsonb_set(game_state, '{round_number}', to_jsonb(new_round));
     game_state := jsonb_set(game_state, '{match_wins}', case when game_state->>'match_over' = 'true' then '[0,0]'::jsonb else game_state->'match_wins' end);
     game_state := jsonb_set(game_state, '{hands}', hands);
-    game_state := jsonb_set(game_state, '{finished}', '[false,false]'::jsonb);
+    game_state := jsonb_set(game_state, '{finished}', '[false,false,false]'::jsonb);
     game_state := jsonb_set(game_state, '{current_player}', '0'::jsonb);
     game_state := jsonb_set(game_state, '{history}', '[]'::jsonb);
     game_state := jsonb_set(game_state, '{over}', 'false'::jsonb);
@@ -539,20 +668,23 @@ begin
     update public.blackjack_rooms
     set state = game_state, deck = cards, updated_at = now()
     where code = room.code;
-    return jsonb_build_object('state', game_state);
+    return jsonb_build_object('state', public._bj_mask_dealer(game_state));
 end;
 $$;
 
 revoke all on function public._bj_new_deck() from public, anon, authenticated;
 revoke all on function public._bj_score(jsonb, text) from public, anon, authenticated;
+revoke all on function public._bj_mask_dealer(jsonb) from public, anon, authenticated;
 revoke all on function public._bj_get_or_create_profile(text, text) from public, anon, authenticated;
-revoke all on function public.create_blackjack_room(text, text, integer, text, text) from public;
-revoke all on function public.join_blackjack_room(text, text, text, text) from public;
+revoke all on function public.create_blackjack_room(text, text, integer, text, text, numeric) from public;
+revoke all on function public.join_blackjack_room(text, text, text, text, numeric) from public;
 revoke all on function public.get_blackjack_room(text, text) from public;
 revoke all on function public.play_blackjack_turn(text, text, text) from public;
 revoke all on function public.next_blackjack_round(text, text) from public;
-grant execute on function public.create_blackjack_room(text, text, integer, text, text) to anon, authenticated;
-grant execute on function public.join_blackjack_room(text, text, text, text) to anon, authenticated;
+grant execute on function public.create_blackjack_room(text, text, integer, text, text, numeric) to anon, authenticated;
+grant execute on function public.join_blackjack_room(text, text, text, text, numeric) to anon, authenticated;
 grant execute on function public.get_blackjack_room(text, text) to anon, authenticated;
 grant execute on function public.play_blackjack_turn(text, text, text) to anon, authenticated;
 grant execute on function public.next_blackjack_round(text, text) to anon, authenticated;
+
+notify pgrst, 'reload schema';
