@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.streamlit/secrets.toml
+android/.gradle/
+android/local.properties
+android/.idea/
+android/**/build/

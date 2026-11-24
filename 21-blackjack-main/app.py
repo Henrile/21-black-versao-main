@@ -15,6 +15,7 @@ COMPUTER_DRAW_DELAY = 0.8
 SUITS = ["♠", "♥", "♦", "♣"]
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 THEMES = {
+    "Velho Oeste": {"felt": "#473126", "accent": "#dcae67", "red": "#a94335", "background": "#17110e"},
     "Cassino": {"felt": "#17463e", "accent": "#f3bd62", "red": "#f05a50", "background": "#111722"},
     "Neon": {"felt": "#30265d", "accent": "#f0d94c", "red": "#ff5679", "background": "#11121e"},
     "Clássico": {"felt": "#244c70", "accent": "#f2ca78", "red": "#bc4545", "background": "#17202b"},
@@ -32,22 +33,32 @@ def create_game(
     names: list[str] | None = None,
     rules: str = "Blackjack",
     best_of: int = 1,
-    theme: str = "Cassino",
+    theme: str = "Velho Oeste",
+    bet: int = 5,
+    wallets: list[float] | None = None,
 ) -> dict:
     if names is None:
-        names = ["Você", "Computador"] if player_count == 1 else ["Jogador 1", "Jogador 2"]
+        names = ["Você"] if player_count == 1 else ["Jogador 1", "Jogador 2"]
+    if bet < 1 or bet > 50:
+        raise ValueError("A aposta precisa estar entre 1 e 50.")
+    if wallets is None:
+        wallets = [50.0, 50.0]
+    if any(wallets[player] < bet for player in range(player_count)):
+        raise ValueError("A aposta não pode ser maior que o saldo disponível.")
     game = {
         "player_count": player_count,
         "names": names,
         "rules": rules,
         "theme": theme,
+        "wallets": wallets.copy(),
+        "bets": [bet, bet],
         "best_of": best_of,
         "wins_needed": best_of // 2 + 1,
         "round_number": 1,
         "match_wins": [0, 0],
         "deck": make_new_deck(),
-        "hands": [[], []],
-        "finished": [False, False],
+        "hands": [[] for _ in range(player_count + 1)],
+        "finished": [False for _ in range(player_count + 1)],
         "current_player": 0,
         "history": [],
         "dealer_playing": False,
@@ -55,8 +66,27 @@ def create_game(
         "match_over": False,
         "result": "",
     }
-    for player in range(2):
-        draw_card(game, player)
+    for player in range(player_count + 1):
+        if player < player_count:
+            game["wallets"][player] -= bet
+    for _ in range(2):
+        for player in range(player_count + 1):
+            draw_card(game, player)
+    dealer = player_count
+    for player in range(player_count):
+        if hand_score(game["hands"][player], rules) == TARGET_SCORE:
+            game["finished"][player] = True
+            game["history"].append(f'{names[player]} recebeu Blackjack natural.')
+    game["finished"][dealer] = False
+    if hand_score(game["hands"][dealer], rules) == TARGET_SCORE:
+        game["dealer_playing"] = False
+        finish_game(game)
+    elif all(game["finished"][:player_count]):
+        game["dealer_playing"] = True
+    else:
+        game["current_player"] = next(
+            index for index, is_finished in enumerate(game["finished"][:player_count]) if not is_finished
+        )
     return game
 
 
@@ -90,47 +120,93 @@ def format_card(card: dict) -> str:
     return f"{card['rank']}{card['suit']}"
 
 
-def finish_game(game: dict) -> None:
-    scores = [hand_score(hand, game["rules"]) for hand in game["hands"]]
-    eligible = [
-        index
-        for index, score in enumerate(scores)
-        if score <= TARGET_SCORE
-    ]
-    if not eligible:
-        game["result"] = "Todos estouraram. Ninguém venceu desta vez."
-        winners = []
-    else:
-        best_score = max(scores[index] for index in eligible)
-        winners = [index for index in eligible if scores[index] == best_score]
-        if len(winners) > 1:
-            game["result"] = "Empate!"
-        else:
-            game["result"] = f"{game['names'][winners[0]]} venceu a rodada com {best_score} pontos!"
+def pixel_character_markup(
+    role: str,
+    name: str,
+    balance: float | None = None,
+    bet: float | None = None,
+) -> str:
+    sprites = {
+        "player": (
+            "JOGADOR",
+            ["..HHHH..", ".HHHHHH.", ".SSSSSS.", ".SE.S.E.", "..SSSS..",
+             "..TTTT..", ".TTTTTT.", ".T.TT.T.", ".LL..LL.", ".LL..LL."],
+        ),
+        "dealer": (
+            "DEALER 8-BIT",
+            ["..CCCC..", ".CCCCCC.", ".SSSSSS.", ".SE.S.E.", "..SSSS..",
+             "..BBBB..", ".BBBBBB.", ".B.BB.B.", "..PPPP..", "..P..P.."],
+        ),
+        "rival": (
+            "RIVAL",
+            ["..HHHH..", ".HHHHHH.", ".SSSSSS.", ".SE.S.E.", "..SSSS..",
+             "..VVVV..", ".VVVVVV.", ".V.VV.V.", "..LL.LL.", "..LL.LL."],
+        ),
+    }
+    label, rows = sprites[role]
+    cells = "".join(
+        f'<span class="pixel-cell pixel-{pixel.lower()}"></span>'
+        for row in rows
+        for pixel in row
+    )
+    balance_markup = (
+        f'<small>CARTEIRA ${balance:.2f} · APOSTA ${bet:.2f}</small>'
+        if balance is not None
+        else ""
+    )
+    return (
+        f'<div class="table-character {role}" aria-label="{label}: {html.escape(name)}">'
+        f'<div class="pixel-sprite" aria-hidden="true">{cells}</div>'
+        f'<div class="character-caption"><span>{label}</span>'
+        f'<strong>{html.escape(name)}</strong>{balance_markup}</div></div>'
+    )
 
-    if len(winners) == 1:
-        game["match_wins"][winners[0]] += 1
+
+def finish_game(game: dict) -> None:
+    dealer_index = game["player_count"]
+    dealer_score = hand_score(game["hands"][dealer_index], game["rules"])
+    dealer_natural = len(game["hands"][dealer_index]) == 2 and dealer_score == TARGET_SCORE
+    dealer_bust = dealer_score > TARGET_SCORE
+    outcomes = []
+    for player in range(game["player_count"]):
+        score = hand_score(game["hands"][player], game["rules"])
+        natural = len(game["hands"][player]) == 2 and score == TARGET_SCORE
+        bet = game["bets"][player]
+        if score > TARGET_SCORE or (dealer_natural and not natural):
+            outcome, payout = "perdeu", 0
+        elif natural and dealer_natural:
+            outcome, payout = "empatou", bet
+        elif natural:
+            outcome, payout = "venceu com Blackjack natural", bet * 2.5
+        elif dealer_bust or score > dealer_score:
+            outcome, payout = "venceu", bet * 2
+        elif score == dealer_score:
+            outcome, payout = "empatou", bet
+        else:
+            outcome, payout = "perdeu", 0
+        game["wallets"][player] += payout
+        if outcome.startswith("venceu"):
+            game["match_wins"][player] += 1
+        outcomes.append(
+            f'{game["names"][player]} {outcome} ({score} contra {dealer_score}); '
+            f'carteira: ${game["wallets"][player]:.2f}'
+        )
+    game["round_outcomes"] = outcomes
+    game["result"] = " | ".join(outcomes)
     game["match_over"] = max(game["match_wins"]) >= game["wins_needed"]
-    if game["match_over"]:
-        match_winner = game["match_wins"].index(max(game["match_wins"]))
-        game["result"] = f"{game['names'][match_winner]} venceu a série!"
     game["over"] = True
 
 
 def advance_turn(game: dict) -> None:
-    if game["player_count"] == 1:
-        if hand_score(game["hands"][0], game["rules"]) > TARGET_SCORE:
-            finish_game(game)
-            return
-        game["dealer_playing"] = True
-        return
-
     next_player = next(
-        (index for index, is_finished in enumerate(game["finished"]) if not is_finished),
+        (
+            index for index, is_finished in enumerate(game["finished"][:game["player_count"]])
+            if not is_finished
+        ),
         None,
     )
     if next_player is None:
-        finish_game(game)
+        game["dealer_playing"] = True
     else:
         game["current_player"] = next_player
 
@@ -156,26 +232,49 @@ def take_turn(action: str) -> None:
         advance_turn(game)
 
 
-def start_next_round(game: dict) -> None:
+def start_next_round(game: dict, bet: int | None = None) -> None:
+    if bet is not None:
+        if bet < 1:
+            raise ValueError("A aposta precisa ser de pelo menos $1.")
+        for player in range(game["player_count"]):
+            if game["wallets"][player] < bet:
+                raise ValueError(f'{game["names"][player]} não tem saldo suficiente para essa aposta.')
+        game["bets"] = [bet, bet]
+    for player in range(game["player_count"]):
+        if game["wallets"][player] < game["bets"][player]:
+            raise ValueError(f'{game["names"][player]} não tem saldo suficiente para a aposta.')
+    for player in range(game["player_count"]):
+        game["wallets"][player] -= game["bets"][player]
     game["round_number"] += 1
     game["deck"] = make_new_deck()
-    game["hands"] = [[], []]
-    game["finished"] = [False, False]
+    game["hands"] = [[] for _ in range(game["player_count"] + 1)]
+    game["finished"] = [False for _ in range(game["player_count"] + 1)]
     game["current_player"] = 0
     game["history"] = []
     game["dealer_playing"] = False
     game["over"] = False
     game["result"] = ""
-    for player in range(2):
-        draw_card(game, player)
+    for _ in range(2):
+        for player in range(game["player_count"] + 1):
+            draw_card(game, player)
+    for player in range(game["player_count"]):
+        if hand_score(game["hands"][player], game["rules"]) == TARGET_SCORE:
+            game["finished"][player] = True
+            game["history"].append(f'{game["names"][player]} recebeu Blackjack natural.')
+    dealer = game["player_count"]
+    if hand_score(game["hands"][dealer], game["rules"]) == TARGET_SCORE or all(
+        game["finished"][:game["player_count"]]
+    ):
+        game["dealer_playing"] = True
+    else:
+        game["current_player"] = next(
+            index for index, is_finished in enumerate(game["finished"][:game["player_count"]]) if not is_finished
+        )
 
 
-def computer_should_hit(game: dict) -> bool:
-    computer_score = hand_score(game["hands"][1], game["rules"])
-    player_score = hand_score(game["hands"][0], game["rules"])
-    if computer_score < 17:
-        return True
-    return player_score <= TARGET_SCORE and computer_score < player_score < TARGET_SCORE
+def dealer_should_hit(game: dict) -> bool:
+    dealer_score = hand_score(game["hands"][game["player_count"]], game["rules"])
+    return dealer_score < 17
 
 
 def get_supabase_client(url: str, anon_key: str):
@@ -200,51 +299,75 @@ def render_sound_control(event_key: str) -> None:
     )
     st.iframe(
         f"""
-        <button id="sound-toggle" type="button" aria-label="Ativar som" title="Ativar som">
-            <span id="sound-icon" aria-hidden="true">🔇</span>
-        </button>
+        <div class="sound-controls">
+            <button id="sound-toggle" type="button" aria-label="Ativar efeitos" title="Ativar efeitos">
+                <span id="sound-icon" aria-hidden="true">🔇</span>
+            </button>
+            <button id="music-toggle" type="button" aria-label="Ativar música 8-bit" title="Ativar música 8-bit">
+                <span aria-hidden="true">🎵</span>
+            </button>
+        </div>
         <span id="sound-status" aria-live="polite"></span>
         <style>
         body {{ margin: 0; font-family: sans-serif; }}
+        .sound-controls {{ display: flex; gap: 6px; }}
         #sound-toggle {{
             display: grid; place-items: center; width: 40px; height: 40px;
             padding: 0; border: 1px solid #66747c; border-radius: 8px;
             background: #202a35; color: #fff2d5; font-size: 20px; cursor: pointer;
         }}
-        #sound-toggle:hover {{ background: #344452; }}
+        #music-toggle {{
+            display: grid; place-items: center; width: 40px; height: 40px;
+            padding: 0; border: 1px solid #66747c; border-radius: 8px;
+            background: #202a35; color: #fff2d5; font-size: 17px; cursor: pointer;
+        }}
+        #sound-toggle:hover, #music-toggle:hover {{ background: #344452; }}
+        #music-toggle.active {{ background: #17463e; border-color: #f3bd62; box-shadow: 0 0 12px rgba(243,189,98,.45); }}
         </style>
         <script>
         const eventKey = {safe_event_key};
         const enabledKey = "blackjack-sounds-enabled";
         const previousKey = "blackjack-sounds-last-event";
+        const musicKey = "blackjack-music-enabled";
         const button = document.getElementById("sound-toggle");
         const icon = document.getElementById("sound-icon");
+        const musicButton = document.getElementById("music-toggle");
         const status = document.getElementById("sound-status");
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        let context = null;
+        let musicTimer = null;
+        let musicStep = 0;
 
         function updateSoundButton(enabled) {{
             icon.textContent = enabled ? "🔊" : "🔇";
-            const label = enabled ? "Desativar som" : "Ativar som";
+            const label = enabled ? "Desativar efeitos" : "Ativar efeitos";
             button.setAttribute("aria-label", label);
             button.title = label;
         }}
 
-        function playTone(frequency) {{
+        function getContext() {{
             if (!AudioContextClass) {{
                 status.textContent = " Áudio não suportado neste navegador.";
-                return;
+                return null;
             }}
-            const context = new AudioContextClass();
-            const oscillator = context.createOscillator();
-            const gain = context.createGain();
+            if (!context) context = new AudioContextClass();
+            if (context.state === "suspended") context.resume();
+            return context;
+        }}
+
+        function playTone(frequency, duration = 0.16, volume = 0.12) {{
+            const audio = getContext();
+            if (!audio) return;
+            const oscillator = audio.createOscillator();
+            const gain = audio.createGain();
+            oscillator.type = "square";
             oscillator.frequency.value = frequency;
-            gain.gain.setValueAtTime(0.12, context.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.16);
+            gain.gain.setValueAtTime(volume, audio.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + duration);
             oscillator.connect(gain);
-            gain.connect(context.destination);
+            gain.connect(audio.destination);
             oscillator.start();
-            oscillator.stop(context.currentTime + 0.16);
-            oscillator.onended = () => context.close();
+            oscillator.stop(audio.currentTime + duration);
         }}
 
         button.addEventListener("click", () => {{
@@ -257,12 +380,42 @@ def render_sound_control(event_key: str) -> None:
             }}
             status.textContent = "";
         }});
+
+        function playMusicNote() {{
+            const melody = [261.63, 329.63, 392.00, 523.25, 392.00, 329.63, 293.66, 392.00];
+            const bass = [130.81, 130.81, 146.83, 146.83];
+            playTone(melody[musicStep % melody.length], 0.11, 0.018);
+            if (musicStep % 4 === 0) playTone(bass[Math.floor(musicStep / 4) % bass.length], 0.18, 0.012);
+            musicStep += 1;
+        }}
+
+        function setMusic(enabled) {{
+            musicButton.classList.toggle("active", enabled);
+            musicButton.setAttribute("aria-label", enabled ? "Desativar música 8-bit" : "Ativar música 8-bit");
+            musicButton.title = enabled ? "Desativar música 8-bit" : "Ativar música 8-bit";
+            if (enabled) {{
+                getContext();
+                playMusicNote();
+                if (!musicTimer) musicTimer = setInterval(playMusicNote, 230);
+            }} else if (musicTimer) {{
+                clearInterval(musicTimer);
+                musicTimer = null;
+            }}
+        }}
+
+        musicButton.addEventListener("click", () => {{
+            const enabled = localStorage.getItem(musicKey) !== "true";
+            localStorage.setItem(musicKey, String(enabled));
+            setMusic(enabled);
+        }});
+
         const enabled = localStorage.getItem(enabledKey) === "true";
         updateSoundButton(enabled);
         if (enabled && localStorage.getItem(previousKey) !== eventKey) {{
             localStorage.setItem(previousKey, eventKey);
             playTone(440);
         }}
+        setMusic(localStorage.getItem(musicKey) === "true");
         </script>
         """,
         height=42,
@@ -288,6 +441,9 @@ def render_online_room(client) -> None:
             return
 
         game = response["state"]
+        if len(game.get("hands", [])) != 3 or "bets" not in game:
+            st.warning("Esta sala foi criada antes das regras de apostas. Crie uma nova sala para jogar.")
+            return
         seat = response["my_seat"]
         palette = THEMES[game["theme"]]
         st.markdown(
@@ -301,7 +457,7 @@ def render_online_room(client) -> None:
             }}
             div[data-testid="stVerticalBlockBorderWrapper"] {{
                 background: repeating-linear-gradient(135deg, rgba(255,255,255,.018) 0 2px, transparent 0 8px),
-                    linear-gradient(145deg, {palette['felt']}, #123b36 120%);
+                    linear-gradient(145deg, {palette['felt']}, {palette['background']} 120%);
                 border-color: {palette['accent']} !important;
             }}
             .eyebrow {{ color: {palette['accent']}; }}
@@ -347,13 +503,14 @@ def render_online_room(client) -> None:
             st.info("Aguardando o segundo jogador entrar na sala.")
 
         stats = response["stats"]
+        game["wallets"] = [float(player_stats["wallet"] or 0) for player_stats in stats]
         stats_columns = st.columns(2)
         for index, column in enumerate(stats_columns):
             player_stats = stats[index]
             column.caption(
                 f'{game["names"][index]} — {player_stats["games_played"]} partidas, '
                 f'{player_stats["wins"]} vitórias, {player_stats["losses"]} derrotas, '
-                f'{player_stats["draws"]} empates'
+                f'{player_stats["draws"]} empates · carteira ${game["wallets"][index]:.2f}'
             )
 
         st.markdown(
@@ -368,27 +525,37 @@ def render_online_room(client) -> None:
         )
         with st.container(border=True):
             st.markdown(f'<div class="eyebrow">Mesa online &nbsp; / &nbsp; Alvo: {TARGET_SCORE}</div>', unsafe_allow_html=True)
-            score_columns = st.columns(2)
+            score_columns = st.columns(3)
             for index, column in enumerate(score_columns):
-                score = hand_score(game["hands"][index], game["rules"])
+                is_dealer = index == 2
+                hidden_hole_card = is_dealer and not game["over"]
+                visible_hand = game["hands"][index][:1] if hidden_hole_card else game["hands"][index]
+                score = hand_score(visible_hand, game["rules"])
                 status = (
+                    "Dealer" if is_dealer else
                     "Estourou" if score > TARGET_SCORE else
                     "Parou" if game["finished"][index] else
-                    "Finalizado" if game["over"] else
                     "Na vez" if index == game["current_player"] else "Aguardando"
                 )
-                suit_color = "#db4c4c" if index == 1 else "#1d4243"
+                suit_color = "#db4c4c" if index else "#1d4243"
                 hand_markup = "".join(
-                    f'<div class="playing-card {"red-suit" if card["suit"] in {"♥", "♦"} else ""}">'
+                    '<div class="playing-card card-back" aria-label="Carta fechada"></div>'
+                    if hidden_hole_card and card_index == 1
+                    else f'<div class="playing-card {"red-suit" if card["suit"] in {"♥", "♦"} else ""}" style="--card-index:{card_index}">'
                     f'<span>{html.escape(card["rank"])}</span><span>{html.escape(card["suit"])}</span></div>'
-                    for card in game["hands"][index]
+                    for card_index, card in enumerate(game["hands"][index])
                 )
+                character_role = "dealer" if is_dealer else "player" if index == 0 else "rival"
+                name = "Dealer" if is_dealer else game["names"][index]
+                balance = None if is_dealer else game["wallets"][index]
+                bet = None if is_dealer else game["bets"][index]
+                panel_score = "?" if hidden_hole_card else f"{score:02d}"
                 column.markdown(
                     f"""
                     <div class="score-panel" style="--suit: {suit_color}">
-                        <div class="card-corner"><span>♠</span><span>{score:02d}</span></div>
-                        <div class="card-value">{score}</div>
-                        <div class="score-name">{html.escape(game["names"][index])}</div>
+                        {pixel_character_markup(character_role, name, balance, bet)}
+                        <div class="card-corner"><span>♠</span><span>{panel_score}</span></div>
+                        <div class="card-value">{panel_score}</div>
                         <div class="score-state">{status}</div>
                     </div>
                     <div class="playing-hand">{hand_markup}</div>
@@ -397,10 +564,10 @@ def render_online_room(client) -> None:
                 )
 
             if game["over"]:
-                if game["result"].startswith(("Empate", "Todos")):
-                    st.info(game["result"])
-                else:
+                if "venceu" in game["result"]:
                     st.success(game["result"])
+                else:
+                    st.info(game["result"])
                 if st.button("Nova rodada", type="primary"):
                     try:
                         call_supabase(
@@ -415,7 +582,10 @@ def render_online_room(client) -> None:
             elif game["names"][1] != "Aguardando jogador":
                 if seat == game["current_player"]:
                     buy_column, stand_column = st.columns(2)
-                    if buy_column.button("Comprar", type="primary", use_container_width=True):
+                    current_score = hand_score(game["hands"][seat], game["rules"])
+                    if buy_column.button(
+                        "Pedir carta", type="primary", use_container_width=True, disabled=current_score >= TARGET_SCORE
+                    ):
                         try:
                             call_supabase(
                                 client,
@@ -499,21 +669,74 @@ st.markdown(
         content: ''; position: absolute; right: -14px; bottom: -30px; width: 110px; height: 110px;
         border: 13px solid rgba(29,55,58,.07); border-radius: 50%;
     }
+    .table-character {
+        position: relative; z-index: 1; display: flex; align-items: center; gap: .65rem;
+        width: fit-content; margin-bottom: .35rem; animation: character-idle 2.4s ease-in-out infinite;
+    }
+    .pixel-sprite {
+        display: grid; grid-template-columns: repeat(8, 6px); grid-auto-rows: 6px;
+        image-rendering: pixelated; filter: drop-shadow(2px 3px 0 rgba(4,18,20,.22));
+    }
+    .pixel-cell { width: 6px; height: 6px; }
+    .pixel-h { background: #4b2d1f; }
+    .pixel-s { background: #efb583; }
+    .pixel-e { background: #17252a; }
+    .pixel-t { background: #d94f4a; }
+    .pixel-l { background: #3154a4; }
+    .pixel-c { background: #f3bd62; }
+    .pixel-b { background: #26384a; }
+    .pixel-p { background: #26384a; }
+    .pixel-v { background: #7748a8; }
+    .character-caption { display: grid; gap: .18rem; }
+    .character-caption span {
+        color: #638078; font: 500 .59rem 'DM Mono', monospace; letter-spacing: .1em;
+    }
+    .character-caption strong {
+        max-width: 180px; overflow: hidden; color: #18252b;
+        font: 500 .75rem 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .character-caption small { color: #638078; font: 500 .62rem 'DM Mono', monospace; }
+    @keyframes character-idle { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
     .card-corner, .card-bottom { color: var(--suit); font-family: 'DM Mono', monospace; font-weight: 500; }
     .card-corner { display: flex; gap: .45rem; font-size: .9rem; }
     .card-value { color: #17252a; font-family: 'Bungee', Impact, sans-serif; font-size: 3.5rem; line-height: 1; }
-    .score-name { color: #34494b; font-family: 'DM Mono', monospace; font-size: .85rem; text-transform: uppercase; }
     .score-state { color: var(--suit); font-family: 'DM Mono', monospace; font-size: .75rem; font-weight: 500; text-transform: uppercase; }
     .card-bottom { position: absolute; right: 1rem; bottom: .7rem; font-size: 2.8rem; opacity: .8; }
-    .playing-hand { display: flex; flex-wrap: wrap; gap: .55rem; margin: .9rem 0 1.1rem; min-height: 72px; }
+    .playing-hand {
+        display: flex; flex-wrap: wrap; gap: .55rem; margin: .9rem 0 1.1rem;
+        min-height: 76px; perspective: 800px;
+    }
     .playing-card {
         display: grid; place-content: space-between; width: 55px; height: 76px; padding: 6px;
         border-radius: 6px; background: #fff2d5; color: #203238; font: 500 .9rem 'DM Mono', monospace;
-        box-shadow: 0 3px 0 rgba(4,18,20,.45); animation: card-deal .24s ease-out both;
+        border: 1px solid rgba(255,255,255,.75);
+        box-shadow: 0 4px 0 rgba(4,18,20,.45), 0 9px 18px rgba(0,0,0,.18);
+        transform-origin: 50% 120%;
+        animation: card-deal .48s cubic-bezier(.2,.75,.25,1.25) both;
+        animation-delay: calc(var(--card-index, 0) * 90ms);
+        transition: transform .18s ease, box-shadow .18s ease;
+        position: relative; overflow: hidden;
     }
+    .playing-card::after {
+        content: ''; position: absolute; inset: -45% -80%;
+        background: linear-gradient(120deg, transparent 42%, rgba(255,255,255,.65) 50%, transparent 58%);
+        transform: translateX(-70%) rotate(8deg);
+        animation: card-shine 1.1s ease-out both;
+        animation-delay: calc(160ms + var(--card-index, 0) * 90ms);
+    }
+    .playing-card:hover { transform: translateY(-7px) rotate(-1deg); box-shadow: 0 8px 0 rgba(4,18,20,.42), 0 15px 22px rgba(0,0,0,.25); }
     .playing-card.red-suit { color: #d54450; }
+    .playing-card.card-back {
+        border: 2px solid #fff2d5;
+        background: repeating-linear-gradient(45deg, #193c70 0 4px, #315c91 4px 7px);
+    }
     .playing-card span:last-child { justify-self: end; font-size: 1.25rem; }
-    @keyframes card-deal { from { opacity: 0; transform: translateY(-12px) rotate(-5deg); } to { opacity: 1; transform: translateY(0) rotate(0); } }
+    @keyframes card-deal {
+        0% { opacity: 0; transform: translate(-70px,-95px) rotateY(180deg) rotateZ(-13deg) scale(.72); }
+        55% { opacity: 1; transform: translate(8px,-9px) rotateY(-12deg) rotateZ(3deg) scale(1.05); }
+        100% { opacity: 1; transform: translate(0,0) rotateY(0) rotateZ(0) scale(1); }
+    }
+    @keyframes card-shine { 0% { opacity: 0; transform: translateX(-70%) rotate(8deg); } 30% { opacity: .7; } 100% { opacity: 0; transform: translateX(70%) rotate(8deg); } }
     .match-score { color: #f3bd62; font: 500 .8rem 'DM Mono', monospace; margin-top: .7rem; }
     div[data-testid="stRadio"] label p, div[data-testid="stRadio"] legend {
         color: var(--cream) !important; font-family: 'DM Mono', monospace !important;
@@ -538,13 +761,54 @@ st.markdown(
         .score-panel { min-height: 170px; padding: .8rem; }
         .card-value { font-size: 2.7rem; }
     }
+    @media (prefers-reduced-motion: reduce) {
+        .table-character { animation: none; }
+        .playing-card, .playing-card::after { animation-duration: .01ms; animation-iteration-count: 1; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-if "game" not in st.session_state:
-    st.session_state.game = create_game()
+if not st.session_state.get("welcome_complete"):
+    welcome_column = st.columns([1, 2, 1])[1]
+    with welcome_column:
+        st.markdown('<div class="eyebrow">Cassino de bolso &nbsp; / &nbsp; Blackjack</div>', unsafe_allow_html=True)
+        st.title("Entre no salão")
+        st.markdown('<p class="tagline">ESCOLHA SEU NOME PARA ENTRAR NA MESA.</p>', unsafe_allow_html=True)
+        with st.container(border=True):
+            with st.form("welcome_screen"):
+                entered_name = st.text_input(
+                    "Nome do jogador",
+                    max_chars=18,
+                    placeholder="Digite seu nome",
+                    key="welcome_player_name",
+                )
+                submitted = st.form_submit_button(
+                    "Entrar na mesa",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if submitted:
+                player_name = entered_name.strip()
+                if not player_name:
+                    st.error("Digite seu nome para continuar.")
+                else:
+                    st.session_state.player_name = player_name
+                    st.session_state.welcome_complete = True
+                    st.session_state.setup_name_one = player_name
+                    st.session_state.setup_name_first = player_name
+                    st.session_state.online_create_name = player_name
+                    st.session_state.game = create_game(names=[player_name])
+                    st.rerun()
+    st.stop()
+
+if (
+    "game" not in st.session_state
+    or "wallets" not in st.session_state.game
+    or len(st.session_state.game["hands"]) != st.session_state.game["player_count"] + 1
+):
+    st.session_state.game = create_game(names=[st.session_state.get("player_name", "Você")])
 
 game = st.session_state.game
 palette = THEMES[game["theme"]]
@@ -559,7 +823,7 @@ st.markdown(
     }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
         background: repeating-linear-gradient(135deg, rgba(255,255,255,.018) 0 2px, transparent 2px 8px),
-            linear-gradient(145deg, {palette['felt']}, #123b36 120%);
+            linear-gradient(145deg, {palette['felt']}, {palette['background']} 120%);
         border-color: {palette['accent']} !important;
     }}
     .eyebrow {{ color: {palette['accent']}; }}
@@ -578,9 +842,9 @@ play_mode = st.radio(
     key="play_mode",
 )
 if play_mode == "Sala online":
-    st.markdown('<div class="eyebrow">Cassino de bolso &nbsp; / &nbsp; Blackjack simplificado</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">Cassino de bolso &nbsp; / &nbsp; Blackjack</div>', unsafe_allow_html=True)
     st.title("Vinte e um")
-    st.markdown('<p class="tagline">COMPRE. SEGURE. NÃO ESTOURE.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="tagline">APOSTE. PEÇA. PARE. VENÇA O DEALER.</p>', unsafe_allow_html=True)
     try:
         from postgrest.exceptions import APIError
         import httpx
@@ -628,14 +892,19 @@ if play_mode == "Sala online":
             )
         with create_tab:
             with st.form("create_online_room"):
-                room_name = st.text_input("Seu nome", value="Jogador 1", max_chars=18)
+                room_name = st.text_input(
+                    "Seu nome",
+                    max_chars=18,
+                    key="online_create_name",
+                )
                 profile_token = st.text_input(
                     "Token de perfil existente (opcional)",
                     value=st.session_state.get("online_profile_token", ""),
                     type="password",
                     help="Deixe vazio para criar um perfil persistente novo.",
                 )
-                room_rules = st.selectbox("Regra", ["Blackjack", "21 simples"])
+                room_rules = st.selectbox("Regra", ["Blackjack"])
+                room_bet = st.number_input("Aposta inicial", min_value=1, value=5, step=1)
                 room_best_of = st.selectbox(
                     "Série", [1, 3, 5],
                     format_func=lambda count: "Uma rodada" if count == 1 else f"Melhor de {count}",
@@ -653,6 +922,7 @@ if play_mode == "Sala online":
                             "p_best_of": room_best_of,
                             "p_theme": room_theme,
                             "p_profile_token": profile_token.strip() or None,
+                            "p_bet": room_bet,
                         },
                     )
                 except (APIError, httpx.HTTPError) as error:
@@ -676,6 +946,7 @@ if play_mode == "Sala online":
                     type="password",
                 )
                 join_name = st.text_input("Seu nome", value="Jogador 2", max_chars=18)
+                join_bet = st.number_input("Sua aposta inicial", min_value=1, value=5, step=1)
                 join_profile_token = st.text_input(
                     "Token de perfil existente (opcional)",
                     value=st.session_state.get("online_profile_token", ""),
@@ -693,6 +964,7 @@ if play_mode == "Sala online":
                             "p_token": join_token,
                             "p_name": join_name.strip(),
                             "p_profile_token": join_profile_token.strip() or None,
+                            "p_bet": join_bet,
                         },
                     )
                 except (APIError, httpx.HTTPError) as error:
@@ -728,17 +1000,17 @@ if play_mode == "Sala online":
         render_online_room(supabase)
     st.stop()
 
-with st.expander("Configurar partida", expanded=False):
+with st.expander("Configurar partida", expanded=True):
     settings_columns = st.columns(3)
     with settings_columns[0]:
         player_count = st.radio(
             "Modo",
             options=[1, 2],
-            format_func=lambda count: "Contra computador" if count == 1 else "Dois jogadores",
+            format_func=lambda count: "Contra dealer" if count == 1 else "Dois jogadores",
             key="setup_player_count",
         )
     with settings_columns[1]:
-        rules = st.selectbox("Regra", ["Blackjack", "21 simples"], key="setup_rules")
+        rules = st.selectbox("Regra", ["Blackjack"], key="setup_rules")
         best_of = st.selectbox(
             "Série",
             [1, 3, 5],
@@ -748,24 +1020,60 @@ with st.expander("Configurar partida", expanded=False):
     with settings_columns[2]:
         theme = st.selectbox("Tema", list(THEMES), key="setup_theme")
         if player_count == 1:
-            first_name = st.text_input("Seu nome", value="Você", max_chars=18, key="setup_name_one")
-            second_name = "Computador"
+            first_name = st.text_input(
+                "Seu nome",
+                max_chars=18,
+                key="setup_name_one",
+            )
+            second_name = "Dealer"
         else:
-            first_name = st.text_input("Nome do jogador 1", value="Jogador 1", max_chars=18, key="setup_name_first")
+            first_name = st.text_input(
+                "Nome do jogador 1",
+                max_chars=18,
+                key="setup_name_first",
+            )
             second_name = st.text_input("Nome do jogador 2", value="Jogador 2", max_chars=18, key="setup_name_second")
+    bet_amount = st.number_input(
+        "Aposta inicial por jogador",
+        min_value=1,
+        max_value=50,
+        value=5,
+        step=1,
+        help="Cada jogador começa com $50. O valor apostado é descontado da carteira.",
+        key="setup_bet",
+    )
     if st.button("Aplicar e iniciar", type="primary", use_container_width=True):
-        names = [first_name.strip() or "Jogador 1", second_name.strip() or "Jogador 2"]
-        st.session_state.game = create_game(player_count, names, rules, best_of, theme)
+        names = [first_name.strip() or "Jogador 1"]
+        if player_count == 2:
+            names.append(second_name.strip() or "Jogador 2")
+        st.session_state.game = create_game(
+            player_count, names, rules, best_of, theme, int(bet_amount)
+        )
         st.rerun()
 
 game = st.session_state.game
+if st.button(
+    "Reiniciar jogo",
+    help="Começa uma nova série, restaura as carteiras para $50 e distribui duas cartas novamente.",
+    key="reset_local_game",
+):
+    st.session_state.game = create_game(
+        game["player_count"],
+        game["names"],
+        game["rules"],
+        game["best_of"],
+        game["theme"],
+        game["bets"][0],
+    )
+    st.rerun()
+
 render_sound_control(
     f'local:{game["round_number"]}:{len(game["history"])}:'
     f'{game["history"][-1] if game["history"] else "início"}'
 )
-st.markdown('<div class="eyebrow">Cassino de bolso &nbsp; / &nbsp; Blackjack simplificado</div>', unsafe_allow_html=True)
+st.markdown('<div class="eyebrow">Cassino de bolso &nbsp; / &nbsp; Blackjack</div>', unsafe_allow_html=True)
 st.title("Vinte e um")
-st.markdown('<p class="tagline">COMPRE. SEGURE. NÃO ESTOURE.</p>', unsafe_allow_html=True)
+st.markdown('<p class="tagline">APOSTE. PEÇA. PARE. VENÇA O DEALER.</p>', unsafe_allow_html=True)
 st.markdown(
     f'<div class="match-score">RODADA {game["round_number"]} &nbsp; · &nbsp; SÉRIE {game["match_wins"][0]} — {game["match_wins"][1]} &nbsp; · &nbsp; {game["rules"].upper()}</div>',
     unsafe_allow_html=True,
@@ -773,22 +1081,35 @@ st.markdown(
 
 with st.container(border=True):
     st.markdown(f'<div class="eyebrow">Mesa 01 &nbsp; / &nbsp; Alvo: {TARGET_SCORE}</div>', unsafe_allow_html=True)
-    score_columns = st.columns(2)
+    score_columns = st.columns(game["player_count"] + 1)
     for index, column in enumerate(score_columns):
+        is_dealer = index == game["player_count"]
         score = hand_score(game["hands"][index], game["rules"])
-        status = "Estourou" if score > TARGET_SCORE else "Parou" if game["finished"][index] else "Finalizado" if game["over"] else "Na vez" if index == game["current_player"] else "Aguardando"
-        suit_color = "#db4c4c" if index == 1 else "#1d4243"
-        hand_markup = "".join(
-            f'<div class="playing-card {"red-suit" if card["suit"] in {"♥", "♦"} else ""}"><span>{card["rank"]}</span><span>{card["suit"]}</span></div>'
-            for card in game["hands"][index]
+        hidden_hole_card = is_dealer and not game["over"]
+        status = (
+            "Dealer" if is_dealer else
+            "Estourou" if score > TARGET_SCORE else
+            "Parou" if game["finished"][index] else
+            "Na vez" if index == game["current_player"] else "Aguardando"
         )
-        player_name = html.escape(game["names"][index])
+        suit_color = "#db4c4c" if index else "#1d4243"
+        hand_markup = "".join(
+            '<div class="playing-card card-back" aria-label="Carta fechada"></div>'
+            if hidden_hole_card and card_index == 1
+            else f'<div class="playing-card {"red-suit" if card["suit"] in {"♥", "♦"} else ""}" style="--card-index:{card_index}"><span>{card["rank"]}</span><span>{card["suit"]}</span></div>'
+            for card_index, card in enumerate(game["hands"][index])
+        )
+        character_role = "dealer" if is_dealer else "player" if index == 0 else "rival"
+        name = "Dealer" if is_dealer else game["names"][index]
+        balance = None if is_dealer else game["wallets"][index]
+        bet = None if is_dealer else game["bets"][index]
+        panel_score = "?" if hidden_hole_card else f"{score:02d}"
         column.markdown(
             f"""
             <div class="score-panel" style="--suit: {suit_color}">
-                <div class="card-corner"><span>♠</span><span>{score:02d}</span></div>
-                <div class="card-value">{score}</div>
-                <div class="score-name">{player_name}</div>
+                {pixel_character_markup(character_role, name, balance, bet)}
+                <div class="card-corner"><span>♠</span><span>{panel_score}</span></div>
+                <div class="card-value">{panel_score}</div>
                 <div class="score-state">{status}</div>
             </div>
             <div class="playing-hand">{hand_markup}</div>
@@ -798,27 +1119,47 @@ with st.container(border=True):
 
     computer_update = st.empty()
     if game["over"]:
-        if game["result"].startswith("Empate") or game["result"].startswith("Todos"):
-            st.info(game["result"])
-        else:
+        if any("venceu" in outcome for outcome in game["round_outcomes"]):
             st.success(game["result"])
+        else:
+            st.info(game["result"])
+        available_bet = min(game["wallets"][:game["player_count"]])
+        if available_bet < 1:
+            st.info("Saldo insuficiente para outra rodada.")
+            next_bet = 1
+        else:
+            next_bet = int(
+                st.number_input(
+                    "Aposta da próxima rodada por jogador",
+                    min_value=1,
+                    max_value=int(available_bet),
+                    value=min(int(game["bets"][0]), int(available_bet)),
+                    step=1,
+                    key=f"next_bet_{game['round_number']}",
+                )
+            )
         if game["match_over"]:
-            if st.button("Nova série", type="primary"):
+            if st.button("Nova série", type="primary", disabled=available_bet < 1):
                 st.session_state.game = create_game(
-                    game["player_count"], game["names"], game["rules"], game["best_of"], game["theme"]
+                    game["player_count"], game["names"], game["rules"], game["best_of"],
+                    game["theme"], next_bet, game["wallets"],
                 )
                 st.rerun()
-        elif st.button("Próxima rodada", type="primary"):
-            start_next_round(game)
-            st.rerun()
+        elif st.button("Próxima rodada", type="primary", disabled=available_bet < 1):
+            try:
+                start_next_round(game, next_bet)
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.rerun()
     elif game["dealer_playing"]:
-        st.subheader("Vez do Computador")
-        computer_update.info("O computador está escolhendo uma carta...")
+        st.subheader("Vez do Dealer")
+        computer_update.info("O dealer está jogando...")
     elif game["current_player"] < game["player_count"]:
         player_name = game["names"][game["current_player"]]
         st.subheader(f"Vez de {player_name}")
         buy_column, stand_column = st.columns(2)
-        if buy_column.button("Comprar", type="primary", use_container_width=True):
+        if buy_column.button("Pedir carta", type="primary", use_container_width=True, disabled=hand_score(game["hands"][game["current_player"]], game["rules"]) >= TARGET_SCORE):
             take_turn("buy")
             st.rerun()
         if stand_column.button("Parar", use_container_width=True):
@@ -831,15 +1172,16 @@ if game["history"]:
             st.write(f"- {event}")
 
 if game["dealer_playing"]:
-    card = draw_card(game, 1)
-    score = hand_score(game["hands"][1], game["rules"])
-    game["history"].append(f"Computador comprou {format_card(card)} ({score} pontos).")
-    computer_update.info(
-        f"Computador comprou {format_card(card)}. Total: {score} pontos."
-    )
-    if not computer_should_hit(game):
+    dealer = game["player_count"]
+    if dealer_should_hit(game):
+        card = draw_card(game, dealer)
+        score = hand_score(game["hands"][dealer], game["rules"])
+        game["history"].append(f"Dealer pediu {format_card(card)} ({score} pontos).")
+        computer_update.info(f"Dealer pediu {format_card(card)}. Total: {score} pontos.")
+        time.sleep(COMPUTER_DRAW_DELAY)
+        st.rerun()
+    else:
         game["dealer_playing"] = False
-        game["finished"][1] = True
+        game["finished"][dealer] = True
         finish_game(game)
-    time.sleep(COMPUTER_DRAW_DELAY)
-    st.rerun()
+        st.rerun()
